@@ -8,7 +8,6 @@ on:
       - "**"
     paths-ignore:
       - "ghostwriter-bridge.mjs"
-      - ".github/workflows/ghostwriter-report.yml"
       - ".env.example"
   pull_request:
     types: [opened, reopened, synchronize, closed]
@@ -58,8 +57,20 @@ jobs:
           const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const branch = String(event.ref ?? "").replace(/^refs\/heads\//, "");
           const repository = event.repository?.name ?? process.env.GITHUB_REPOSITORY?.split("/").pop() ?? process.env.GHOSTWRITER_PROJECT_ID;
+          const watcherPaths = new Set([
+            "ghostwriter-bridge.mjs",
+            ".github/workflows/ghostwriter-report.yml",
+            ".env.example"
+          ]);
 
           for (const commit of event.commits ?? []) {
+            const changedPaths = [
+              ...(commit.added ?? []),
+              ...(commit.modified ?? []),
+              ...(commit.removed ?? [])
+            ];
+            if (changedPaths.length > 0 && changedPaths.every((path) => watcherPaths.has(path))) continue;
+
             await sendGhostWriterEvent({
               source: "github-actions-project-report",
               sourceEventId: commit.id,
