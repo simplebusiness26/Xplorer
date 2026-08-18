@@ -19,6 +19,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: ghostwriter-report-${{ github.repository }}-${{ github.ref }}
@@ -34,21 +35,24 @@ jobs:
       GHOSTWRITER_PROJECT_ORIGIN: existing
       GHOSTWRITER_INGEST_SECRET: ${{ secrets.GHOSTWRITER_INGEST_SECRET }}
     steps:
-      - name: Ghost Writer connection status
-        if: ${{ env.GHOSTWRITER_INGEST_SECRET == '' }}
-        run: echo "Ghost Writer is installed but needs the GHOSTWRITER_INGEST_SECRET repository secret before reporting can start."
+      - name: Select Ghost Writer authentication
+        run: |
+          if [ -n "$GHOSTWRITER_INGEST_SECRET" ]; then
+            echo "Using HMAC authentication."
+          else
+            echo "Using GitHub OIDC authentication."
+          fi
 
       - uses: actions/checkout@v4
-        if: ${{ env.GHOSTWRITER_INGEST_SECRET != '' }}
         with:
           fetch-depth: 30
 
       - name: Bootstrap existing project context
-        if: ${{ github.event_name == 'workflow_dispatch' && env.GHOSTWRITER_INGEST_SECRET != '' }}
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         run: node ghostwriter-bridge.mjs --bootstrap-existing
 
       - name: Report pushed commits
-        if: ${{ github.event_name == 'push' && env.GHOSTWRITER_INGEST_SECRET != '' }}
+        if: ${{ github.event_name == 'push' }}
         run: |
           node --input-type=module <<'NODE'
           import { readFileSync } from "node:fs";
@@ -69,7 +73,26 @@ jobs:
               ...(commit.modified ?? []),
               ...(commit.removed ?? [])
             ];
-            if (changedPaths.length > 0 && changedPaths.every((path) => watcherPaths.has(path))) continue;
+            if (changedPaths.length > 0 && changedPaths.every((path) => watcherPaths.has(path))) {
+              await sendGhostWriterEvent({
+                source: "github-actions-project-report",
+                sourceEventId: commit.id,
+                type: "project.connected",
+                truthState: "completed",
+                privacy: "internal",
+                contentEligible: false,
+                title: `${repository} Ghost Writer connection updated`,
+                summary: "The repository watcher configuration was updated and its authenticated connection was verified.",
+                sourceReference: commit.url,
+                payload: {
+                  repository: event.repository?.full_name,
+                  branch,
+                  projectOrigin: "existing",
+                  connectionUpdate: true
+                }
+              });
+              continue;
+            }
 
             await sendGhostWriterEvent({
               source: "github-actions-project-report",
@@ -93,7 +116,7 @@ jobs:
           NODE
 
       - name: Report pull request activity
-        if: ${{ github.event_name == 'pull_request' && env.GHOSTWRITER_INGEST_SECRET != '' }}
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           node --input-type=module <<'NODE'
           import { readFileSync } from "node:fs";
