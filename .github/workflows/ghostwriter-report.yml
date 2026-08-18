@@ -33,7 +33,6 @@ jobs:
       GHOSTWRITER_ENDPOINT: https://theghostwriterv2.onrender.com
       GHOSTWRITER_PROJECT_ID: xplorer
       GHOSTWRITER_PROJECT_ORIGIN: existing
-      GHOSTWRITER_INGEST_SECRET: ${{ secrets.GHOSTWRITER_INGEST_SECRET }}
     steps:
       - name: Select Ghost Writer authentication
         run: |
