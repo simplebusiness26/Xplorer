@@ -1,0 +1,116 @@
+name: Ghost Writer project report
+
+on:
+  push:
+    branches:
+      - "**"
+    tags-ignore:
+      - "**"
+    paths-ignore:
+      - "ghostwriter-bridge.mjs"
+      - ".github/workflows/ghostwriter-report.yml"
+      - ".env.example"
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+    paths-ignore:
+      - "ghostwriter-bridge.mjs"
+      - ".github/workflows/ghostwriter-report.yml"
+      - ".env.example"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ghostwriter-report-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  report-project-activity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GHOSTWRITER_ENDPOINT: https://theghostwriterv2.onrender.com
+      GHOSTWRITER_PROJECT_ID: xplorer
+      GHOSTWRITER_PROJECT_ORIGIN: existing
+      GHOSTWRITER_INGEST_SECRET: ${{ secrets.GHOSTWRITER_INGEST_SECRET }}
+    steps:
+      - name: Ghost Writer connection status
+        if: ${{ env.GHOSTWRITER_INGEST_SECRET == '' }}
+        run: echo "Ghost Writer is installed but needs the GHOSTWRITER_INGEST_SECRET repository secret before reporting can start."
+
+      - uses: actions/checkout@v4
+        if: ${{ env.GHOSTWRITER_INGEST_SECRET != '' }}
+        with:
+          fetch-depth: 30
+
+      - name: Bootstrap existing project context
+        if: ${{ github.event_name == 'workflow_dispatch' && env.GHOSTWRITER_INGEST_SECRET != '' }}
+        run: node ghostwriter-bridge.mjs --bootstrap-existing
+
+      - name: Report pushed commits
+        if: ${{ github.event_name == 'push' && env.GHOSTWRITER_INGEST_SECRET != '' }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          import { sendGhostWriterEvent } from "./ghostwriter-bridge.mjs";
+
+          const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+          const branch = String(event.ref ?? "").replace(/^refs\/heads\//, "");
+          const repository = event.repository?.name ?? process.env.GITHUB_REPOSITORY?.split("/").pop() ?? process.env.GHOSTWRITER_PROJECT_ID;
+
+          for (const commit of event.commits ?? []) {
+            await sendGhostWriterEvent({
+              source: "github-actions-project-report",
+              sourceEventId: commit.id,
+              type: "git.commit",
+              truthState: "in_progress",
+              privacy: "content_eligible",
+              contentEligible: true,
+              title: `${repository} development update`,
+              summary: commit.message,
+              sourceReference: commit.url,
+              payload: {
+                repository: event.repository?.full_name,
+                branch,
+                before: event.before,
+                after: event.after,
+                projectOrigin: "existing"
+              }
+            });
+          }
+          NODE
+
+      - name: Report pull request activity
+        if: ${{ github.event_name == 'pull_request' && env.GHOSTWRITER_INGEST_SECRET != '' }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          import { sendGhostWriterEvent } from "./ghostwriter-bridge.mjs";
+
+          const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+          const pr = event.pull_request;
+          const merged = event.action === "closed" && pr?.merged === true;
+          const repository = event.repository?.name ?? process.env.GITHUB_REPOSITORY?.split("/").pop() ?? process.env.GHOSTWRITER_PROJECT_ID;
+
+          await sendGhostWriterEvent({
+            source: "github-actions-project-report",
+            sourceEventId: `pull-request:${event.number}:${event.action}:${pr?.head?.sha ?? "unknown"}`,
+            type: merged ? "git.merge" : "git.pull_request",
+            truthState: merged ? "completed" : "in_progress",
+            privacy: merged ? "content_eligible" : "internal",
+            contentEligible: merged,
+            title: merged ? `${repository} pull request merged` : `${repository} pull request updated`,
+            summary: pr?.title ?? `Pull request #${event.number}`,
+            sourceReference: pr?.html_url,
+            payload: {
+              repository: event.repository?.full_name,
+              pullRequest: event.number,
+              action: event.action,
+              headBranch: pr?.head?.ref,
+              baseBranch: pr?.base?.ref,
+              merged,
+              projectOrigin: "existing"
+            }
+          });
+          NODE
