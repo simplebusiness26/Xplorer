@@ -6,15 +6,18 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
+const DEFAULT_OIDC_AUDIENCE = "ghost-writer-v2";
+let cachedOidcToken;
+
 export async function sendGhostWriterEvent(activity, options = {}) {
   const endpoint = clean(options.endpoint ?? process.env.GHOSTWRITER_ENDPOINT);
   const projectId = clean(options.projectId ?? process.env.GHOSTWRITER_PROJECT_ID);
   const secret = clean(options.secret ?? process.env.GHOSTWRITER_INGEST_SECRET);
+  const repository = clean(options.repository ?? process.env.GITHUB_REPOSITORY);
   const projectOrigin = normalizeProjectOrigin(options.projectOrigin ?? process.env.GHOSTWRITER_PROJECT_ORIGIN);
 
   if (!endpoint) throw new Error("GHOSTWRITER_ENDPOINT is required");
   if (!projectId) throw new Error("GHOSTWRITER_PROJECT_ID is required");
-  if (!secret) throw new Error("GHOSTWRITER_INGEST_SECRET is required");
   if (!activity || typeof activity !== "object" || Array.isArray(activity)) throw new Error("Bridge activity must be a JSON object");
   if (!clean(activity.type)) throw new Error("Bridge activity requires a type");
 
@@ -23,6 +26,7 @@ export async function sendGhostWriterEvent(activity, options = {}) {
     ...(activity.payload && typeof activity.payload === "object" && !Array.isArray(activity.payload) ? activity.payload : {})
   };
   if (projectOrigin && payload.projectOrigin === undefined) payload.projectOrigin = projectOrigin;
+  if (repository && payload.repository === undefined) payload.repository = repository;
 
   const event = {
     ...activity,
@@ -35,12 +39,14 @@ export async function sendGhostWriterEvent(activity, options = {}) {
   };
 
   const raw = JSON.stringify(event);
-  const signature = createHmac("sha256", secret).update(raw).digest("hex");
+  const authentication = secret
+    ? { "X-GhostWriter-Signature": `sha256=${createHmac("sha256", secret).update(raw).digest("hex")}` }
+    : { Authorization: `Bearer ${await getGitHubOidcToken(options)}` };
   const response = await fetch(`${endpoint.replace(/\/$/, "")}/v1/events`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-GhostWriter-Signature": `sha256=${signature}`
+      ...authentication
     },
     body: raw
   });
@@ -48,6 +54,35 @@ export async function sendGhostWriterEvent(activity, options = {}) {
   const text = await response.text();
   if (!response.ok) throw new Error(`Ghost Writer rejected bridge event (${response.status}): ${text.slice(0, 500)}`);
   return text ? JSON.parse(text) : {};
+}
+
+export async function getGitHubOidcToken(options = {}) {
+  const supplied = clean(options.oidcToken);
+  if (supplied) return supplied;
+  if (cachedOidcToken && cachedOidcToken.expiresAt > Date.now() + 30_000) return cachedOidcToken.value;
+
+  const requestUrl = clean(options.oidcRequestUrl ?? process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+  const requestToken = clean(options.oidcRequestToken ?? process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN);
+  const audience = clean(options.oidcAudience ?? process.env.GHOSTWRITER_OIDC_AUDIENCE) || DEFAULT_OIDC_AUDIENCE;
+  if (!requestUrl || !requestToken) {
+    throw new Error("Ghost Writer requires either GHOSTWRITER_INGEST_SECRET or GitHub Actions OIDC");
+  }
+
+  const url = new URL(requestUrl);
+  url.searchParams.set("audience", audience);
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${requestToken}`
+    }
+  });
+  if (!response.ok) throw new Error(`Unable to request GitHub Actions OIDC token (${response.status})`);
+  const body = await response.json();
+  const value = clean(body?.value);
+  if (!value) throw new Error("GitHub Actions OIDC provider returned no token");
+
+  cachedOidcToken = { value, expiresAt: tokenExpiry(value) };
+  return value;
 }
 
 export async function bootstrapExistingProject(options = {}) {
@@ -162,6 +197,16 @@ function normalizeProjectOrigin(value) {
   if (!normalized) return "";
   if (normalized === "new" || normalized === "existing") return normalized;
   throw new Error("GHOSTWRITER_PROJECT_ORIGIN must be either 'new' or 'existing'");
+}
+
+function tokenExpiry(token) {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
+    if (Number.isFinite(payload.exp)) return payload.exp * 1000;
+  } catch {
+    // The receiver performs authoritative JWT validation; this is cache metadata only.
+  }
+  return Date.now() + 60_000;
 }
 
 function clean(value) {
